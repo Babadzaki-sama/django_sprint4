@@ -3,18 +3,33 @@ from django.utils import timezone
 from django.contrib.auth.decorators import login_required
 from django.db.models import Count
 from django.core.paginator import Paginator
+from django.http import Http404
 
 from .models import Post, Category, Comment, User
 from .forms import PostForm, ProfileEditForm, CommentForm
 
 
-def get_posts(post_objects):
-    """Посты из БД."""
-    return post_objects.filter(
-        pub_date__lte=timezone.now(),
+def get_posts(post_objects, user=None, include_user_drafts=False):
+    """Посты из БД с учётом прав доступа пользователя.
+
+    Args:
+        post_objects: QuerySet постов
+        user: Текущий пользователь (опционально)
+        include_user_drafts: Включать ли черновики пользователя (для его профиля)
+    """
+    # Базовый фильтр для опубликованных постов
+    published_posts = post_objects.filter(
         is_published=True,
-        category__is_published=True
-    ).annotate(comment_count=Count('comments'))
+        category__is_published=True,
+        pub_date__lte=timezone.now()
+    )
+
+    # Если нужно включить черновики пользователя
+    if include_user_drafts and user and user.is_authenticated:
+        user_posts = post_objects.filter(author=user)
+        return (published_posts | user_posts).distinct()
+
+    return published_posts
 
 
 def get_paginator(request, items, num=10):
@@ -27,7 +42,11 @@ def get_paginator(request, items, num=10):
 def index(request):
     """Главная страница."""
     template = 'blog/index.html'
-    post_list = get_posts(Post.objects).order_by('-pub_date')
+    post_list = get_posts(
+        Post.objects,
+        request.user,
+        include_user_drafts=False
+    ).annotate(comment_count=Count('comments')).order_by('-pub_date')
     page_obj = get_paginator(request, post_list)
     context = {'page_obj': page_obj}
     return render(request, template, context)
@@ -36,16 +55,18 @@ def index(request):
 def post_detail(request, post_id):
     """Полное описание выбранной записи."""
     template = 'blog/detail.html'
+    post = get_object_or_404(Post, id=post_id)
 
-    try:
-        # Сначала пытаемся получить пост с учетом прав автора
-        if request.user.is_authenticated:
-            post = Post.objects.get(id=post_id, author=request.user)
-        else:
-            post = get_posts(Post.objects).get(id=post_id)
-    except Post.DoesNotExist:
-        # Если пользователь не автор или пост не опубликован - 404
-        post = get_object_or_404(get_posts(Post.objects), id=post_id)
+    # Проверяем права доступа
+    is_author = request.user == post.author
+    is_published = (
+            post.is_published and
+            post.category.is_published and
+            post.pub_date <= timezone.now()
+    )
+
+    if not (is_author or is_published):
+        raise Http404("Пост не найден или у вас нет прав для просмотра")
 
     comments = post.comments.order_by('created_at')
     form = CommentForm()
@@ -58,7 +79,13 @@ def category_posts(request, category_slug):
     template = 'blog/category.html'
     category = get_object_or_404(
         Category, slug=category_slug, is_published=True)
-    post_list = get_posts(category.posts).order_by('-pub_date')
+
+    post_list = get_posts(
+        category.posts,
+        request.user,
+        include_user_drafts=False
+    ).annotate(comment_count=Count('comments')).order_by('-pub_date')
+
     page_obj = get_paginator(request, post_list)
     context = {'category': category, 'page_obj': page_obj}
     return render(request, template, context)
@@ -82,12 +109,21 @@ def create_post(request):
 
 
 def profile(request, username):
-    #Возвращает профиль пользователя
+    """Возвращает профиль пользователя."""
     template = 'blog/profile.html'
     user = get_object_or_404(User, username=username)
 
-    # Фильтруем посты
-    posts_list = get_posts(user.posts).order_by('-pub_date')
+    # Определяем, кто просматривает профиль
+    is_own_profile = request.user == user
+
+    # Для автора включаем черновики, для других - только опубликованные
+    include_drafts = is_own_profile
+
+    posts_list = get_posts(
+        user.posts,
+        request.user,
+        include_user_drafts=include_drafts
+    ).annotate(comment_count=Count('comments')).order_by('-pub_date')
 
     page_obj = get_paginator(request, posts_list)
     context = {'profile': user, 'page_obj': page_obj}
@@ -120,7 +156,7 @@ def edit_post(request, post_id):
         form = PostForm(
             request.POST, files=request.FILES or None, instance=post)
         if form.is_valid():
-            post.save()
+            form.save()
             return redirect('blog:post_detail', post_id)
     else:
         form = PostForm(instance=post)
@@ -136,9 +172,8 @@ def delete_post(request, post_id):
     if request.user != post.author:
         return redirect('blog:post_detail', post_id)
     if request.method == 'POST':
-        form = PostForm(request.POST or None, instance=post)
         post.delete()
-        return redirect('blog:index')
+        return redirect('blog:profile', request.user.username)
     else:
         form = PostForm(instance=post)
     context = {'form': form}
