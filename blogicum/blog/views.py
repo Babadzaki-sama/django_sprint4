@@ -36,12 +36,20 @@ def index(request):
 def post_detail(request, post_id):
     """Полное описание выбранной записи."""
     template = 'blog/detail.html'
-    posts = get_object_or_404(Post, id=post_id)
-    if request.user != posts.author:
-        posts = get_object_or_404(get_posts(Post.objects), id=post_id)
-    comments = posts.comments.order_by('created_at')
+
+    try:
+        # Сначала пытаемся получить пост с учетом прав автора
+        if request.user.is_authenticated:
+            post = Post.objects.get(id=post_id, author=request.user)
+        else:
+            post = get_posts(Post.objects).get(id=post_id)
+    except Post.DoesNotExist:
+        # Если пользователь не автор или пост не опубликован - 404
+        post = get_object_or_404(get_posts(Post.objects), id=post_id)
+
+    comments = post.comments.order_by('created_at')
     form = CommentForm()
-    context = {'post': posts, 'form': form, 'comments': comments}
+    context = {'post': post, 'form': form, 'comments': comments}
     return render(request, template, context)
 
 
@@ -74,14 +82,13 @@ def create_post(request):
 
 
 def profile(request, username):
-    """Возвращает профиль пользователя."""
+    #Возвращает профиль пользователя
     template = 'blog/profile.html'
     user = get_object_or_404(User, username=username)
-    posts_list = (
-        user.posts
-        .annotate(comment_count=Count('comments'))
-        .order_by('-pub_date')
-    )
+
+    # Фильтруем посты
+    posts_list = get_posts(user.posts).order_by('-pub_date')
+
     page_obj = get_paginator(request, posts_list)
     context = {'profile': user, 'page_obj': page_obj}
     return render(request, template, context)
